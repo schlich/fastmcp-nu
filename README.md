@@ -33,6 +33,21 @@ The protocol core is plain Nushell with no dependencies. stdio needs only
 - Nushell 0.113 or newer (developed on 0.116.1; http-nu 0.17.2 embeds 0.113.1).
 - Optional: `http-nu` for `--http`, and `node` for the streaming test.
 
+## Nix
+
+The flake packages the CLI with a pinned Nushell, with http-nu, `sh` and
+`cat` available behind your own PATH:
+
+```
+nix run . -- run examples/weather.nu   # run a server
+nix profile install .                  # put `fastmcp-nu` on PATH
+nix develop                            # nushell, http-nu and node for hacking
+nix flake check                        # build, then run the test suite in the sandbox
+```
+
+Nix only sees files that Git tracks; for files that are not tracked yet,
+use `path:.` instead of `.`.
+
 ## Quick start
 
 Try the bundled example:
