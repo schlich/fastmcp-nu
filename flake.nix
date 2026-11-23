@@ -72,6 +72,7 @@
           meta = {
             description = "Build Model Context Protocol servers from annotated Nushell commands";
             mainProgram = "fastmcp-nu";
+            license = lib.licenses.mit;
             inherit (pkgs.nushell.meta) platforms;
           };
         };
