@@ -1,0 +1,150 @@
+#!/usr/bin/env nu
+# fastmcp-nu: run annotated Nushell modules as MCP servers.
+#
+# Named fastmcp-nu, not fastmcp, so it never shadows Python FastMCP's
+# `fastmcp` command on PATH. The Nushell module itself is still `fastmcp`.
+
+# The CLI needs only codegen from the module.
+use ../fastmcp/bootstrap.nu [codegen]
+
+# Directory holding the fastmcp module; passed to child processes as -I.
+const LIB = (path self | path dirname | path dirname)
+
+def die [message: string]: nothing -> nothing {
+  print --stderr $"fastmcp-nu: ($message)"
+  exit 1
+}
+
+def resolve-server [server: string]: nothing -> string {
+  let file = ($server | path expand)
+  if not ($file | path exists) {
+    die $"no such server module: ($server)"
+  }
+  $file
+}
+
+# Discover the manifest in a child process, where the module's commands and
+# its optional MCP_SERVER constant are in scope.
+def load-manifest [file: string]: nothing -> record {
+  let stem = ($file | path parse | get stem)
+  let script = [
+    'use fastmcp'
+    $"use ($file | to nuon) *"
+    "let opts = (scope variables | where name == '$MCP_SERVER' | get value | get 0? | default {})"
+    $"let info = \({name: ($stem | to nuon)} | merge \(if 'instructions' in $opts { $opts | reject instructions } else { $opts }\)\)"
+    'fastmcp discover --info $info --instructions $opts.instructions? | to nuon'
+  ] | str join "\n"
+  let result = (^$nu.current-exe -n -I $LIB -c $script | complete)
+  if $result.exit_code != 0 {
+    die $"failed to load ($file):\n($result.stderr)"
+  }
+  $result.stdout | from nuon
+}
+
+# Write the generated script to a content-addressed cache file.
+def write-generated [file: string, script: string]: nothing -> string {
+  let preferred = ($nu.cache-dir | path join fastmcp-nu)
+  let dir = (try { mkdir $preferred; $preferred } catch { $nu.temp-dir | path join fastmcp-nu })
+  mkdir $dir
+  let stem = ($file | path parse | get stem)
+  let key = ($"($file)\n($script)" | hash sha256 | str substring 0..15)
+  let target = ($dir | path join $"($stem)-($key).nu")
+  if not ($target | path exists) {
+    let tmp = $"($target).(random chars --length 8).tmp"
+    $script | save --force $tmp
+    mv --force $tmp $target
+  }
+  $target
+}
+
+def summary [manifest: record]: nothing -> string {
+  let counts = [
+    [($manifest.tools | length) tool]
+    [($manifest.resources | length) resource]
+    [($manifest.templates | length) 'resource template']
+    [($manifest.prompts | length) prompt]
+  ]
+  $counts
+  | where {|c| $c.0 > 0 }
+  | each {|c| $"($c.0) ($c.1)(if $c.0 == 1 { '' } else { 's' })" }
+  | str join ', '
+  | if $in == '' { 'nothing annotated' } else { $in }
+}
+
+# Run annotated Nushell modules as MCP servers.
+def main []: nothing -> string {
+  help main
+}
+
+# Run a server module: stdio by default, or Streamable HTTP with --http.
+#
+# Imports the module once to discover its @mcp-tool, @mcp-resource and
+# @mcp-prompt commands, generates a script with a static dispatcher, and
+# replaces this process with `nu --stdin` (or http-nu) running it.
+def "main run" [
+  server: string                     # Path to the server module
+  --http: string                     # Serve Streamable HTTP via http-nu on this address, e.g. :3001
+  --path: string = '/mcp'            # HTTP endpoint path
+  --allow-origin: list<string> = []  # HTTP: extra allowed Origin values ('*' allows any)
+  --no-guard                         # stdio: let tools write to stdout directly (no fd swap)
+]: nothing -> nothing {
+  let file = (resolve-server $server)
+  let manifest = (load-manifest $file)
+  let transport = (if $http == null { 'stdio' } else { 'http' })
+  let script = (codegen $file $manifest --transport $transport --path $path --allow-origin $allow_origin)
+  let generated = (write-generated $file $script)
+  print --stderr $"[fastmcp-nu] ($manifest.info.name) ($manifest.info.version): (summary $manifest) over ($transport)"
+
+  if $http != null {
+    let http_nu = (which http-nu | get 0?.path)
+    if $http_nu == null {
+      die 'http-nu is not on PATH; install it (e.g. `nix shell nixpkgs#http-nu`) to use --http'
+    }
+    print --stderr $"[fastmcp-nu] listening on ($http)($path)"
+    exec $http_nu -I $LIB $http $generated
+  } else if (not $no_guard) and $nu.os-info.family == 'unix' and (which sh | is-not-empty) {
+    # Keep the client's stdout on fd 3 for protocol messages and point fd 1
+    # at stderr, so a stray `print` or external command in a tool is logged
+    # instead of corrupting the JSON-RPC stream.
+    with-env {FASTMCP_OUTPUT_FD: '3'} {
+      exec sh -c 'exec 3>&1 1>&2; exec "$0" -n --stdin -I "$1" "$2"' $nu.current-exe $LIB $generated
+    }
+  } else {
+    exec $nu.current-exe -n --stdin -I $LIB $generated
+  }
+}
+
+# Print a module's manifest as the MCP list methods would report it.
+def "main inspect" [
+  server: string  # Path to the server module
+]: nothing -> string {
+  let manifest = (load-manifest (resolve-server $server))
+  {
+    serverInfo: $manifest.info
+    instructions: $manifest.instructions
+    tools: ($manifest.tools | each {|t| $t.spec })
+    resources: ($manifest.resources | each {|r| $r.spec })
+    resourceTemplates: ($manifest.templates | each {|t| $t.spec })
+    prompts: ($manifest.prompts | each {|p| $p.spec })
+  }
+  | to json --indent 2
+}
+
+# Generate the server script without running it.
+def "main build" [
+  server: string                     # Path to the server module
+  --output (-o): string              # Write here instead of stdout
+  --http                             # Generate an http-nu handler script instead of stdio
+  --path: string = '/mcp'            # HTTP endpoint path
+  --allow-origin: list<string> = []  # HTTP: extra allowed Origin values
+]: nothing -> any {
+  let file = (resolve-server $server)
+  let manifest = (load-manifest $file)
+  let script = (codegen $file $manifest --transport (if $http { 'http' } else { 'stdio' }) --path $path --allow-origin $allow_origin)
+  if $output == null {
+    $script
+  } else {
+    $script | save --force $output
+    print --stderr $"[fastmcp-nu] wrote ($output); run it with: nu -n --stdin -I ($LIB) ($output)"
+  }
+}
